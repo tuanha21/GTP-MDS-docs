@@ -1,0 +1,973 @@
+openapi: 3.1.0
+info:
+  title: Market Data Server — Client API (v2, Dynamic Common API)
+  version: "2.0.0"
+  description: >
+    Machine-readable contract for Part B7 (Draft Client API Design) of
+    market-data-server-proposed-system-specification-v2.md. Client traffic uses one dynamic
+    batch endpoint instead of one REST path per data shape; a caller sends a batch of named
+    service calls and chooses which output fields it wants back.
+    Services 1-8 (symbolHistory, symbolatest, quote, quoteSummary, marketTop,
+    tradingview.history, marketStatus, holiday) are field-accurate against the client-supplied
+    source pattern. Services 9-17 (search, chart, orderbook, index, company, fundamentals,
+    dividends, shareholding-changes, financials/statements) are Proposed, newly authored per
+    §B7.6 and are the most likely to change once real provider/reference data is confirmed.
+externalDocs:
+  description: Full narrative specification (§B7 Draft Client API Design)
+  url: ./market-data-server-proposed-system-specification-v2.md
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/common/market:
+    post:
+      operationId: postCommonMarketBatch
+      summary: Execute a batch of market-data service calls
+      description: >
+        Position in the request array is the correlation key; the response array has exactly
+        the same length and order. One item failing never fails sibling items (§B7.1-§B7.2).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              minItems: 1
+              maxItems: 50
+              items:
+                $ref: '#/components/schemas/CommonMarketRequestItem'
+            examples:
+              mixedBatch:
+                summary: Quote plus market status in one call
+                value:
+                  - serviceCode: quote
+                    args: { symbol: SSI, fetchCount: 50 }
+                    projection: []
+                  - serviceCode: marketStatus
+                    args: {}
+                    projection: [market, status]
+      responses:
+        '200':
+          description: >
+            Batch accepted and processed. HTTP 200 does not imply every item succeeded —
+            check each item's `isSuccess`.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CommonMarketResponseItem'
+        '400':
+          $ref: '#/components/responses/BatchRejected'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: No valid service catalog snapshot installed yet (SERVICE_CATALOG_UNAVAILABLE)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/v1/market-data/offerings:
+    get:
+      operationId: getMarketDataOfferings
+      summary: Return active technical offerings visible to the caller (§B7.8)
+      description: Not commercial pricing — reflects only technical MDS offerings, not Core Trading products.
+      responses:
+        '200':
+          description: Active offerings visible to the caller's token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfferingsResponse'
+
+  /api/v1/market-data/entitlements/me:
+    get:
+      operationId: getMyEntitlements
+      summary: Explain token-derived MDS rights for client diagnostics (§B7.8)
+      description: >
+        Must not expose internal provider credentials, other customer data, or commercial
+        rules not already represented by the caller's token.
+      responses:
+        '200':
+          description: Entitlement diagnostic for the calling token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntitlementsMeResponse'
+
+  /api/v1/market-data/exchanges:
+    get:
+      operationId: getMarketDataExchanges
+      summary: Return supported exchanges and data capabilities (§B7.8)
+      responses:
+        '200':
+          description: Supported exchanges
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExchangesResponse'
+
+  /api/v1/market-data/stream:
+    get:
+      operationId: openMarketDataStream
+      summary: WebSocket streaming upgrade (§B7.9) — not a plain HTTP response
+      description: >
+        `Upgrade: websocket`. Not modeled as request/response JSON here; see §B7.9 for the
+        SUBSCRIBE/UNSUBSCRIBE/REAUTHENTICATE/PING client commands and the
+        SUBSCRIBED/DATA/DENIED/REAUTHENTICATION_REQUIRED/SUBSCRIPTION_TERMINATED/ERROR server
+        messages. OpenAPI does not model WebSocket message frames; an AsyncAPI document would
+        be the right artifact for that protocol and is not produced here.
+      responses:
+        '101':
+          description: Switching Protocols to WebSocket
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Common platform token issued by the shared Login Server (§B11).
+
+  responses:
+    Unauthorized:
+      description: Token invalid, expired, or entitlement version revoked (§B9.6)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    BatchRejected:
+      description: >
+        Malformed batch (not an array, empty, over 50 items, or an item missing a required
+        field) — rejected whole before any item is dispatched.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+
+  schemas:
+    # ---------- shared envelope ----------
+    ErrorDetail:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - SERVICE_NOT_FOUND
+            - SERVICE_SUSPENDED
+            - INVALID_ARGS
+            - MARKET_DATA_ENTITLEMENT_DENIED
+            - TOKEN_EXPIRED
+            - TOKEN_AUDIENCE_INVALID
+            - ENTITLEMENT_VERSION_REVOKED
+            - MALFORMED_REPLY
+            - DOWNSTREAM_TIMEOUT
+            - DOWNSTREAM_ERROR
+        message:
+          type: string
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+    LocalizedText:
+      type: object
+      description: JSON object keyed by BCP 47 language tag.
+      additionalProperties:
+        type: string
+      example: { en: "SSI Securities Corporation", vi: "Công ty Cổ phần Chứng khoán SSI" }
+    PriceLevel:
+      type: object
+      properties:
+        p: { type: number, description: Price }
+        v: { type: number, description: Volume }
+    SymbolInfo:
+      description: Shared output shape for symbolatest (§B7.6.2) and marketTop (§B7.6.5).
+      type: object
+      properties:
+        s: { type: string, description: Symbol }
+        re: { type: number, description: Reference price }
+        o: { type: number, description: Open price }
+        h: { type: number, description: High price }
+        l: { type: number, description: Low price }
+        c: { type: number, description: Last price }
+        ch: { type: number, description: Change amount }
+        r: { type: number, description: Change ratio }
+        vo: { type: number, description: Matched volume }
+        va: { type: number, description: Matched value }
+        a: { type: number, description: Average price }
+        ti: { type: integer, format: int64, description: Last update timestamp (epoch ms) }
+        mv: { type: number, description: Last matched volume }
+        bb:
+          type: array
+          description: Bid ladder, best bid first
+          items: { $ref: '#/components/schemas/PriceLevel' }
+        bo:
+          type: array
+          description: Ask ladder, best ask first
+          items: { $ref: '#/components/schemas/PriceLevel' }
+
+    # ---------- 1. symbolHistory ----------
+    SymbolHistoryArgs:
+      type: object
+      required: [symbol, from, to]
+      properties:
+        symbol: { type: string, example: SSI }
+        from: { type: string, pattern: '^\d{8}$', description: yyyyMMdd, example: "20250428" }
+        to: { type: string, pattern: '^\d{8}$', description: yyyyMMdd, example: "20250528" }
+    SymbolHistoryBar:
+      type: object
+      properties:
+        o: { type: number }
+        h: { type: number }
+        l: { type: number }
+        c: { type: number }
+        re: { type: number }
+        adj: { type: number }
+        r: { type: number }
+        ch: { type: number }
+        vo: { type: number }
+        va: { type: number }
+        pvo: { type: number }
+        pva: { type: number }
+        frBvo: { type: number }
+        frSvo: { type: number }
+        frBva: { type: number }
+        frSva: { type: number }
+        startDate: { type: integer, format: int64 }
+        endDate: { type: integer, format: int64 }
+    SymbolHistoryOutput:
+      type: array
+      items: { $ref: '#/components/schemas/SymbolHistoryBar' }
+
+    # ---------- 2. symbolatest ----------
+    SymbolAtestArgs:
+      type: object
+      required: [symbolList]
+      properties:
+        symbolList:
+          type: array
+          items: { type: string }
+          example: [AAA, ACB]
+    SymbolAtestOutput:
+      type: array
+      items: { $ref: '#/components/schemas/SymbolInfo' }
+
+    # ---------- 3. quote ----------
+    QuoteArgs:
+      type: object
+      required: [symbol, fetchCount]
+      properties:
+        symbol: { type: string }
+        lastIndex: { type: integer, description: Omit or 0 on first call }
+        lastSize: { type: integer, description: Omit on first call }
+        fetchCount: { type: integer, description: Maximum records to return }
+    QuoteTick:
+      type: object
+      properties:
+        o: { type: number }
+        c: { type: number }
+        h: { type: number }
+        l: { type: number }
+        ti: { type: integer, format: int64 }
+        mb: { type: string, enum: [BUY, SELL] }
+        mv: { type: number }
+        r: { type: number }
+        va: { type: number }
+        vo: { type: number }
+    QuoteOutput:
+      type: object
+      properties:
+        lastIndex: { type: integer, description: Cursor to pass as lastIndex on the next call }
+        lastSize: { type: integer, description: Total matched count as of this call }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/QuoteTick' }
+
+    # ---------- 4. quoteSummary ----------
+    QuoteSummaryArgs:
+      type: object
+      required: [symbol]
+      properties:
+        symbol: { type: string }
+    QuoteSummaryOutput:
+      type: object
+      properties:
+        price: { type: number }
+        volume: { type: number }
+        buyVolume: { type: number }
+        sellVolume: { type: number }
+        bsVolume: { type: number }
+        buyRate: { type: number }
+        bsRate: { type: number }
+
+    # ---------- 5. marketTop ----------
+    MarketTopArgs:
+      type: object
+      required: [top, fetchCount]
+      anyOf:
+        - required: [market]
+        - required: [index]
+      properties:
+        market: { type: string, description: e.g. HOSE, HNX, UPCOM }
+        index: { type: string, description: e.g. VN-INDEX }
+        top:
+          type: string
+          description: >
+            One TopEnum value (e.g. TOP_TRADING_VOLUME, TOP_CHANGE_UP, TOP_FOREIGN_NET_BUY).
+            The source pattern enumerates roughly 120 values; not fully reproduced here.
+        fetchCount: { type: integer }
+    MarketTopOutput:
+      type: array
+      items: { $ref: '#/components/schemas/SymbolInfo' }
+
+    # ---------- 6. tradingview.history ----------
+    TradingviewHistoryArgs:
+      type: object
+      required: [from, to, resolution]
+      anyOf:
+        - required: [symbol]
+        - required: [symbolList]
+      properties:
+        symbol: { type: string }
+        symbolList: { type: array, items: { type: string } }
+        from: { type: integer, description: Unix seconds }
+        to: { type: integer, description: Unix seconds }
+        resolution:
+          type: string
+          enum: ["1", "3", "5", "10", "15", "30", "60", D, 1D, W, 1W, M, 1M, 6M]
+    TradingviewHistoryOutput:
+      type: object
+      properties:
+        t: { type: array, items: { type: integer }, description: Bar timestamps, epoch seconds }
+        o: { type: array, items: { type: number } }
+        h: { type: array, items: { type: number } }
+        l: { type: array, items: { type: number } }
+        c: { type: array, items: { type: number } }
+        v: { type: array, items: { type: number } }
+        s: { type: string, description: '"ok", or a TradingView status code such as "no_data"' }
+        nextTime: { type: [integer, "null"], description: Pagination cursor; null when no more history precedes from }
+
+    # ---------- 7. marketStatus ----------
+    MarketStatusArgs:
+      type: object
+      additionalProperties: false
+    MarketStatusEntry:
+      type: object
+      properties:
+        market: { type: string }
+        type: { type: string, enum: [EQUITY, DERIVATIVES] }
+        status: { type: string, example: CLOSED }
+        lastTradingDate: { type: integer, format: int64 }
+        lastMarketInit: { type: integer, format: int64 }
+        time: { type: integer, format: int64 }
+    MarketStatusOutput:
+      type: array
+      items: { $ref: '#/components/schemas/MarketStatusEntry' }
+
+    # ---------- 8. holiday ----------
+    HolidayArgs:
+      type: object
+      additionalProperties: false
+    HolidayOutput:
+      type: array
+      items: { type: string, pattern: '^\d{8}$', description: yyyyMMdd }
+
+    # ---------- 9. search (Proposed, newly authored) ----------
+    SearchArgs:
+      type: object
+      required: [exchange]
+      properties:
+        exchange: { type: string, description: Normalized exchange/market code }
+        symbol: { type: string, description: Exact or prefix match }
+        query: { type: string, maxLength: 100 }
+        board: { type: string, maxLength: 20 }
+        limit: { type: integer, default: 20, minimum: 1, maximum: 100 }
+    SearchInstrument:
+      type: object
+      properties:
+        exchange: { type: string }
+        board: { type: string }
+        symbol: { type: string }
+        name: { $ref: '#/components/schemas/LocalizedText' }
+        isin: { type: string }
+        currency: { type: string }
+        lotSize: { type: integer }
+        status: { type: string }
+        priceDecimals: { type: integer }
+        qtyDecimals: { type: integer }
+    SearchOutput:
+      type: array
+      items: { $ref: '#/components/schemas/SearchInstrument' }
+
+    # ---------- 10. chart (Proposed, newly authored) ----------
+    ChartArgs:
+      type: object
+      required: [symbol, period, from, to]
+      properties:
+        symbol: { type: string }
+        period: { type: string, enum: [1m, 5m, 15m, 30m, 1h, 1D] }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+    ChartOutput:
+      type: object
+      properties:
+        symbol: { type: string }
+        period: { type: string }
+        columns:
+          type: array
+          items: { type: string }
+          example: [time, open, high, low, close, volume, turnover]
+        bars:
+          type: array
+          items:
+            type: array
+            items: {}
+          description: One positional array per bar, ordered as `columns`.
+
+    # ---------- 11. orderbook (Proposed, newly authored) ----------
+    OrderbookArgs:
+      type: object
+      required: [symbol]
+      properties:
+        symbol: { type: string }
+        depth: { type: string, enum: [top, full], default: top }
+    OrderbookLevel:
+      type: object
+      properties:
+        price: { type: number }
+        qty: { type: integer }
+    OrderbookOutput:
+      type: object
+      properties:
+        symbol: { type: string }
+        bids: { type: array, items: { $ref: '#/components/schemas/OrderbookLevel' } }
+        asks: { type: array, items: { $ref: '#/components/schemas/OrderbookLevel' } }
+        time: { type: string, format: date-time }
+
+    # ---------- 12. index (Proposed, newly authored) ----------
+    IndexArgs:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string, example: VN-INDEX }
+    IndexOutput:
+      type: object
+      properties:
+        code: { type: string }
+        name: { $ref: '#/components/schemas/LocalizedText' }
+        value: { type: number }
+        prevClose: { type: number }
+        change: { type: number }
+        changePct: { type: number }
+        time: { type: string, format: date-time }
+
+    # ---------- 13. company (Proposed, newly authored) ----------
+    CompanyArgs:
+      type: object
+      required: [symbol]
+      properties:
+        symbol: { type: string }
+        language: { type: string, description: BCP 47 language tag }
+    CompanyDirector:
+      type: object
+      properties:
+        name: { type: string }
+        position: { type: string }
+    CompanyShareholder:
+      type: object
+      properties:
+        name: { type: string }
+        holdNum: { type: number }
+    CompanyOutput:
+      type: object
+      properties:
+        symbol: { type: string }
+        name: { $ref: '#/components/schemas/LocalizedText' }
+        business: { type: string }
+        chairperson: { type: string }
+        listingDate: { type: string, format: date-time }
+        issuePrice: { type: number }
+        issueAmount: { type: number }
+        totalCapital: { type: number }
+        directors: { type: array, items: { $ref: '#/components/schemas/CompanyDirector' } }
+        shareholders: { type: array, items: { $ref: '#/components/schemas/CompanyShareholder' } }
+
+    # ---------- 14. fundamentals (Proposed, newly authored) ----------
+    FundamentalsArgs:
+      type: object
+      required: [symbol]
+      properties:
+        symbol: { type: string }
+    FundamentalsOutput:
+      type: object
+      properties:
+        dividend: { type: number }
+        yield: { type: number }
+        peRatio: { type: number }
+        pbRatio: { type: number }
+        eps: { type: number }
+        netAssetPs: { type: number }
+        w52High: { type: number }
+        w52Low: { type: number }
+        marketCap: { type: number }
+        netProfit: { type: number }
+
+    # ---------- 15. dividends (Proposed, newly authored) ----------
+    DividendsArgs:
+      type: object
+      required: [symbol]
+      properties:
+        symbol: { type: string }
+        page: { type: integer, default: 0, minimum: 0 }
+        pageSize: { type: integer, default: 20, minimum: 1, maximum: 100 }
+        language: { type: string }
+    DividendEntry:
+      type: object
+      properties:
+        type: { type: string }
+        content: { type: string }
+        announceDate: { type: string, format: date-time }
+        clearDate: { type: string, format: date-time }
+        dividendDate: { type: string, format: date-time }
+    DividendsOutput:
+      type: object
+      properties:
+        symbol: { type: string }
+        dividends: { type: array, items: { $ref: '#/components/schemas/DividendEntry' } }
+
+    # ---------- 16. shareholding-changes (Proposed, newly authored) ----------
+    ShareholdingChangesArgs:
+      type: object
+      required: [symbol]
+      properties:
+        symbol: { type: string }
+        language: { type: string }
+    ShareholdingChangeEntry:
+      type: object
+      properties:
+        name: { type: string }
+        date: { type: string, format: date-time }
+        changeNum: { type: number }
+        holdNum: { type: number }
+        holdRate: { type: number }
+        type: { type: string }
+    ShareholdingChangesOutput:
+      type: object
+      properties:
+        symbol: { type: string }
+        changes: { type: array, items: { $ref: '#/components/schemas/ShareholdingChangeEntry' } }
+
+    # ---------- 17. financials/statements (Proposed, newly authored) ----------
+    FinancialsStatementsArgs:
+      type: object
+      required: [symbol]
+      properties:
+        symbol: { type: string }
+        language: { type: string }
+    FinancialPeriod:
+      type: object
+      properties:
+        periodEnd: { type: string, format: date-time }
+        fiscalYear: { type: integer }
+        periodType: { type: string }
+        incomeStatement: { type: object, additionalProperties: true }
+        balanceSheet: { type: object, additionalProperties: true }
+        cashFlow: { type: object, additionalProperties: true }
+        ratios: { type: object, additionalProperties: true }
+    FinancialsStatementsOutput:
+      type: object
+      properties:
+        symbol: { type: string }
+        currency: { type: string }
+        periods: { type: array, items: { $ref: '#/components/schemas/FinancialPeriod' } }
+
+    # ---------- request/response item wrappers, one pair per serviceCode ----------
+    SymbolHistoryRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: symbolHistory }
+        args: { $ref: '#/components/schemas/SymbolHistoryArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    SymbolHistoryResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: symbolHistory }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/SymbolHistoryOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    SymbolAtestRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: symbolatest }
+        args: { $ref: '#/components/schemas/SymbolAtestArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    SymbolAtestResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: symbolatest }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/SymbolAtestOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    QuoteRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: quote }
+        args: { $ref: '#/components/schemas/QuoteArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    QuoteResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: quote }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/QuoteOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    QuoteSummaryRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: quoteSummary }
+        args: { $ref: '#/components/schemas/QuoteSummaryArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    QuoteSummaryResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: quoteSummary }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/QuoteSummaryOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    MarketTopRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: marketTop }
+        args: { $ref: '#/components/schemas/MarketTopArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    MarketTopResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: marketTop }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/MarketTopOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    TradingviewHistoryRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: tradingview.history }
+        args: { $ref: '#/components/schemas/TradingviewHistoryArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    TradingviewHistoryResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: tradingview.history }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/TradingviewHistoryOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    MarketStatusRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: marketStatus }
+        args: { $ref: '#/components/schemas/MarketStatusArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    MarketStatusResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: marketStatus }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/MarketStatusOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    HolidayRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: holiday }
+        args: { $ref: '#/components/schemas/HolidayArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    HolidayResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: holiday }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/HolidayOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    SearchRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: search }
+        args: { $ref: '#/components/schemas/SearchArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    SearchResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: search }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/SearchOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    ChartRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: chart }
+        args: { $ref: '#/components/schemas/ChartArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    ChartResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: chart }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/ChartOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    OrderbookRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: orderbook }
+        args: { $ref: '#/components/schemas/OrderbookArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    OrderbookResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: orderbook }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/OrderbookOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    IndexRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: index }
+        args: { $ref: '#/components/schemas/IndexArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    IndexResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: index }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/IndexOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    CompanyRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: company }
+        args: { $ref: '#/components/schemas/CompanyArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    CompanyResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: company }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/CompanyOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    FundamentalsRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: fundamentals }
+        args: { $ref: '#/components/schemas/FundamentalsArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    FundamentalsResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: fundamentals }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/FundamentalsOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    DividendsRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: dividends }
+        args: { $ref: '#/components/schemas/DividendsArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    DividendsResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: dividends }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/DividendsOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    ShareholdingChangesRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: shareholding-changes }
+        args: { $ref: '#/components/schemas/ShareholdingChangesArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    ShareholdingChangesResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: shareholding-changes }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/ShareholdingChangesOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    FinancialsStatementsRequestItem:
+      type: object
+      required: [serviceCode, args]
+      properties:
+        serviceCode: { const: financials/statements }
+        args: { $ref: '#/components/schemas/FinancialsStatementsArgs' }
+        projection: { type: array, items: { type: string }, default: [] }
+    FinancialsStatementsResponseItem:
+      type: object
+      required: [serviceCode, isSuccess]
+      properties:
+        serviceCode: { const: financials/statements }
+        isSuccess: { type: boolean }
+        data: { $ref: '#/components/schemas/FinancialsStatementsOutput' }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+
+    # ---------- batch envelope discriminated unions ----------
+    CommonMarketRequestItem:
+      oneOf:
+        - $ref: '#/components/schemas/SymbolHistoryRequestItem'
+        - $ref: '#/components/schemas/SymbolAtestRequestItem'
+        - $ref: '#/components/schemas/QuoteRequestItem'
+        - $ref: '#/components/schemas/QuoteSummaryRequestItem'
+        - $ref: '#/components/schemas/MarketTopRequestItem'
+        - $ref: '#/components/schemas/TradingviewHistoryRequestItem'
+        - $ref: '#/components/schemas/MarketStatusRequestItem'
+        - $ref: '#/components/schemas/HolidayRequestItem'
+        - $ref: '#/components/schemas/SearchRequestItem'
+        - $ref: '#/components/schemas/ChartRequestItem'
+        - $ref: '#/components/schemas/OrderbookRequestItem'
+        - $ref: '#/components/schemas/IndexRequestItem'
+        - $ref: '#/components/schemas/CompanyRequestItem'
+        - $ref: '#/components/schemas/FundamentalsRequestItem'
+        - $ref: '#/components/schemas/DividendsRequestItem'
+        - $ref: '#/components/schemas/ShareholdingChangesRequestItem'
+        - $ref: '#/components/schemas/FinancialsStatementsRequestItem'
+      discriminator:
+        propertyName: serviceCode
+        mapping:
+          symbolHistory: '#/components/schemas/SymbolHistoryRequestItem'
+          symbolatest: '#/components/schemas/SymbolAtestRequestItem'
+          quote: '#/components/schemas/QuoteRequestItem'
+          quoteSummary: '#/components/schemas/QuoteSummaryRequestItem'
+          marketTop: '#/components/schemas/MarketTopRequestItem'
+          tradingview.history: '#/components/schemas/TradingviewHistoryRequestItem'
+          marketStatus: '#/components/schemas/MarketStatusRequestItem'
+          holiday: '#/components/schemas/HolidayRequestItem'
+          search: '#/components/schemas/SearchRequestItem'
+          chart: '#/components/schemas/ChartRequestItem'
+          orderbook: '#/components/schemas/OrderbookRequestItem'
+          index: '#/components/schemas/IndexRequestItem'
+          company: '#/components/schemas/CompanyRequestItem'
+          fundamentals: '#/components/schemas/FundamentalsRequestItem'
+          dividends: '#/components/schemas/DividendsRequestItem'
+          shareholding-changes: '#/components/schemas/ShareholdingChangesRequestItem'
+          financials/statements: '#/components/schemas/FinancialsStatementsRequestItem'
+
+    CommonMarketResponseItem:
+      oneOf:
+        - $ref: '#/components/schemas/SymbolHistoryResponseItem'
+        - $ref: '#/components/schemas/SymbolAtestResponseItem'
+        - $ref: '#/components/schemas/QuoteResponseItem'
+        - $ref: '#/components/schemas/QuoteSummaryResponseItem'
+        - $ref: '#/components/schemas/MarketTopResponseItem'
+        - $ref: '#/components/schemas/TradingviewHistoryResponseItem'
+        - $ref: '#/components/schemas/MarketStatusResponseItem'
+        - $ref: '#/components/schemas/HolidayResponseItem'
+        - $ref: '#/components/schemas/SearchResponseItem'
+        - $ref: '#/components/schemas/ChartResponseItem'
+        - $ref: '#/components/schemas/OrderbookResponseItem'
+        - $ref: '#/components/schemas/IndexResponseItem'
+        - $ref: '#/components/schemas/CompanyResponseItem'
+        - $ref: '#/components/schemas/FundamentalsResponseItem'
+        - $ref: '#/components/schemas/DividendsResponseItem'
+        - $ref: '#/components/schemas/ShareholdingChangesResponseItem'
+        - $ref: '#/components/schemas/FinancialsStatementsResponseItem'
+      discriminator:
+        propertyName: serviceCode
+        mapping:
+          symbolHistory: '#/components/schemas/SymbolHistoryResponseItem'
+          symbolatest: '#/components/schemas/SymbolAtestResponseItem'
+          quote: '#/components/schemas/QuoteResponseItem'
+          quoteSummary: '#/components/schemas/QuoteSummaryResponseItem'
+          marketTop: '#/components/schemas/MarketTopResponseItem'
+          tradingview.history: '#/components/schemas/TradingviewHistoryResponseItem'
+          marketStatus: '#/components/schemas/MarketStatusResponseItem'
+          holiday: '#/components/schemas/HolidayResponseItem'
+          search: '#/components/schemas/SearchResponseItem'
+          chart: '#/components/schemas/ChartResponseItem'
+          orderbook: '#/components/schemas/OrderbookResponseItem'
+          index: '#/components/schemas/IndexResponseItem'
+          company: '#/components/schemas/CompanyResponseItem'
+          fundamentals: '#/components/schemas/FundamentalsResponseItem'
+          dividends: '#/components/schemas/DividendsResponseItem'
+          shareholding-changes: '#/components/schemas/ShareholdingChangesResponseItem'
+          financials/statements: '#/components/schemas/FinancialsStatementsResponseItem'
+
+    # ---------- discovery endpoints (kept generic; not field-speced in §B7.8) ----------
+    OfferingsResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              offeringCode: { type: string, example: 'MDS:HK:QUOTE:L1:SNAPSHOT' }
+              status: { type: string, enum: [ACTIVE] }
+    EntitlementsMeResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            marketDataOfferings:
+              type: array
+              items: { type: string }
+    ExchangesResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              exchangeId: { type: string }
+              countryCode: { type: string }
+              timezone: { type: string }
+              currencyCode: { type: string }
