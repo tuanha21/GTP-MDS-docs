@@ -676,9 +676,12 @@ MDS stores no provider token (§A5.3), so the session id cannot be the public id
 
 | Value | Who holds it | On Kafka | In logs |
 |---|---|---|---|
-| `sessionID` — the provider's session | The client, and the memory of the instance holding its socket | Never | Never |
-| `sessionKey` = `xxHash64(salt ‖ sessionID)` | Every service | **Yes — the message key** | Yes |
+| `sessionID` — the provider's session | The client, and the service that logged it in | Never | Never |
+| `sessionKey` = `xxHash64(salt ‖ sessionID)` | Every service, including the instance holding the socket | **Yes — the message key** | Yes |
+| `streamTicket` | Redis, for 60 s, until one handshake consumes it (§B4.3) | Never | Never — masked |
 | `connectionId` | The instance holding the socket | Yes, in the delivery payload | Yes |
+
+`market-stream` never learns a `sessionID`. It is given a `sessionKey` at the handshake and works with nothing else, so the credential of §A5.3 stays with the two parties that must hold it: the client and the service that logged it in.
 
 The salt is one shared secret from the secret manager, so every service computes the same key.
 
@@ -690,7 +693,7 @@ The salt is one shared secret from the secret manager, so every service computes
 | Which partition carries the message | `sessionKey` keys both `market.stream.command.v1` and `market.stream.delivery.v1` |
 | Which instance consumes it | Static assignment: instance `i` of `M` owns every partition where `p % M == i` (§D2.7) |
 
-Because all three come from one hash, **a session's messages always arrive at the instance holding its socket** — no routing table and no second hop. A socket that reaches the wrong instance is closed with `STREAM_WRONG_NODE` and the correct `p`; that is a misconfigured ingress, not a client error.
+Because all three come from one hash, **a session's messages always arrive at the instance holding its socket** — no routing table and no second hop. A handshake that reaches the wrong instance is refused with the correct `p` before any socket exists (§B4.3); that is a misconfigured ingress, not a client error.
 
 **A new session is a new connection.** A re-login produces a different session id, so a different hash and a different partition. Rather than carry a connection's state across that change, MDS closes the socket and the client reconnects — the path it must already have for a lost socket (§B4.4).
 
@@ -702,24 +705,47 @@ Because all three come from one hash, **a session's messages always arrive at th
 
 ![Login and connect](https://raw.githubusercontent.com/tuanha21/GTP-MDS-docs/main/designs/assets/market-data-server/mds-b4-connect.png)
 
-**Text alternative:** The client logs in through the Client API Gateway with `auth.login` and receives the provider session and its partition. It opens a WebSocket presenting that partition; the ingress routes by it and the instance refuses a socket that is not its own. The instance hashes the session and writes one in-memory entry holding the connection id, the session, the subscriptions and the sequence per symbol. A subscribe command is published keyed by the session key; the forward-service instance owning that key subscribes upstream on the customer's own TTL session.
+**Text alternative:** The client logs in through the Client API Gateway. The service that answers the login hashes the provider session into the session key, derives the partition, mints a single-use ticket and writes it to Redis for sixty seconds; the reply carries the partition and the ticket, never the session key and never a URL. The client opens a WebSocket presenting the partition and the ticket. The handshake is an HTTP request, so it can be refused before a socket exists: the instance consumes the ticket with one atomic read-and-delete, refuses if it is missing or if its partition is not the instance's own, and otherwise answers 101. It then writes one in-memory entry holding the connection id, the session key, the subscriptions and the sequence per symbol. A subscribe command is published keyed by the session key; the forward-service instance owning that key subscribes upstream on the customer's own TTL session.
+
+**A connection is authenticated before it exists.** The WebSocket handshake is an ordinary HTTP `GET` carrying `Upgrade: websocket`; the socket begins only when the server answers `101`. MDS decides there. Nothing is ever admitted on an unauthenticated socket, so there is no half-open state to hold, no first-message timeout to tune, and an unknown caller costs one rejected HTTP request.
+
+**Why the client does not present the session id.** A browser cannot put a header on a WebSocket: `new WebSocket(url, protocols)` takes a URL and subprotocols and nothing else, and every language compiled into a page — TypeScript, Dart, Blazor, Go and Rust through WebAssembly — ends at that same API. Only the URL is left, and a URL reaches access logs, browser history and `Referer`. The provider session must never travel that way (§A5.3). So the client presents a **ticket**: minted at login, worth one handshake, worthless a minute later.
+
+| The ticket | |
+|---|---|
+| Minted by | Whoever answered `auth.login` — `forward-service` in FORWARD, the auth service in STORAGE. It is the only party holding the `sessionID`, and it already computes `sessionKey` and `p` for the reply |
+| Held in | Redis — `stream:ticket:{32 random bytes}` → `{ sessionKey, p, issuedAt }`, TTL `STREAM_TICKET_TTL`, 60 s |
+| Never holds | `sessionID`, `mdsToken`, or any provider credential. The record names a session; it does not contain one |
+| Spent | Once. `market-stream` reads it with a single atomic `GETDEL`, so a second use — a replay from a log — finds nothing |
+| Never renewed | A ticket opens one socket, and nothing extends it. A socket lost to a network fault or a deploy is rebuilt the way §B4.4 already requires — log in again, take the new `p`, connect, subscribe |
+| Not accompanied by a URL | Where to connect is agreed between the back end and the client, not returned by login. A login reply describes the session, not where the system lives |
 
 | # | Step | Result |
 |---|---|---|
-| 1 | `POST /api/v1/auth/login` | `mdsToken` — the provider session — and `streamPartition` |
-| 2 | Client opens the WebSocket presenting `p` | The ingress lands it on the instance owning `p`, which verifies and issues a `connectionId` |
-| 3 | Client sends `sub` | One message on `market.stream.command.v1`, key `sessionKey`, carrying the `connectionId` |
-| 4 | `forward-service` subscribes upstream under the customer's own session | The provider begins pushing |
-| 5 | `forward-service` publishes each update on `market.stream.delivery.v1`, key `sessionKey` | It lands on `p` |
-| 6 | The owning instance finds the connection and writes the frame | One Kafka hop, one socket write |
+| 1 | `POST /api/v1/auth/login` | `mdsToken` — the provider session — plus `streamPartition` and `streamTicket` |
+| 2 | Client opens `wss://…/stream?p=37&ticket=…` | The ingress routes on `p` |
+| 3 | The instance consumes the ticket and checks its `p` | `101`, or a refusal below — no socket is created. It writes one registry entry and issues a `connectionId` |
+| 4 | Client sends `sub` | One message on `market.stream.command.v1`, key `sessionKey`, carrying the `connectionId` |
+| 5 | `forward-service` subscribes upstream under the customer's own session | The provider begins pushing |
+| 6 | `forward-service` publishes each update on `market.stream.delivery.v1`, key `sessionKey` | It lands on `p` |
+| 7 | The owning instance finds the connection and writes the frame | One Kafka hop, one socket write |
 
-The registry lives in memory, not in Redis: when an instance is lost its sockets are lost with it, and the client reconnects.
+**Refused at the handshake.** There is no socket yet, so these are HTTP statuses, not close codes.
+
+| Status · code | When |
+|---|---|
+| `401 STREAM_TICKET_INVALID` | No ticket, or one that is unknown, expired or already spent |
+| `409 STREAM_WRONG_NODE` | The ticket's `p` is not this instance's; the correct `p` is in the body, and the ingress is misconfigured |
+
+**One path, for every kind of client.** A client that is not a browser — a partner's own server in Java or Python — can set `Authorization` on a handshake, and it is tempting to let it present the session directly. MDS does not: that would be a second way in, and it would put a provider session in a component that has no reason to hold one. Every client logs in, every login returns a ticket, and the ticket is what opens a socket.
+
+The registry lives in memory, not in Redis: when an instance is lost its sockets are lost with it, and the client reconnects. Redis holds one thing, for a minute at a time: a ticket that names a session key and a partition.
 
 ### B4.4 When the provider session expires
 
 ![When the provider session expires](https://raw.githubusercontent.com/tuanha21/GTP-MDS-docs/main/designs/assets/market-data-server/mds-b4-expiry.png)
 
-**Text alternative:** Above, what happens when the session dies: TTL answers 401, but only to the next command MDS sends; forward-service marks that session dead and tells the socket's owner; market-stream closes the socket with `AUTH_TOKEN_EXPIRED`; the client logs in again and receives a new session and a new partition. Below, the single recovery path, the same whatever the cause — an expired session, a network fault or a deploy: log in, connect to the instance owning the new partition, subscribe again, take the snapshot and continue.
+**Text alternative:** Above, what happens when the session dies: TTL answers 401, but only to the next command MDS sends; forward-service marks that session dead and tells the socket's owner; market-stream closes the socket with `AUTH_TOKEN_EXPIRED`; the client logs in again and receives a new session, a new partition and a new ticket. Below, the single recovery path, the same whatever the cause — an expired session, a network fault or a deploy: log in, connect to the instance owning the new partition, subscribe again, take the snapshot and continue.
 
 **The provider does not announce an expiry.** TTL answers `401` only to a message MDS sends it, so an expiry is learned at the next command, not at the moment it happens.
 
@@ -738,7 +764,7 @@ The registry lives in memory, not in Redis: when an instance is lost its sockets
 | 1 | `forward-service` marks that provider session dead **once**, so other items in flight for the same session do not each hit TTL with a dead id |
 | 2 | It publishes one control message for that `sessionKey` |
 | 3 | `market-stream` closes the socket with `AUTH_TOKEN_EXPIRED`, dropping the session's state |
-| 4 | The client logs in again, receives a new session and a new `p`, connects, and subscribes again |
+| 4 | The client logs in again, receives a new session, a new `p` and a new ticket, connects, and subscribes again |
 
 **One recovery path, whatever the cause.** An expiry, a network fault, a rolling deploy and a lost instance all end the same way: the socket is gone, and the client rebuilds it. That is the path a client must implement anyway, so streaming carries no second one — no grace window, no in-band token frame, and no state kept for a connection that has ended.
 
@@ -748,13 +774,13 @@ The registry lives in memory, not in Redis: when an instance is lost its sockets
 
 ![The connection's life](https://raw.githubusercontent.com/tuanha21/GTP-MDS-docs/main/designs/assets/market-data-server/mds-b4-lifecycle.png)
 
-**Text alternative:** Above, the four states of a connection: OPEN once the handshake is done, the partition checked and a connection id issued; ACTIVE once the first subscribe is accepted and the upstream subscription exists; CLOSING once a reason is known and the teardown has been sent; CLOSED once the registry entry is gone. Below, what happens when it ends: market-stream closes the socket and sends `stream.close` on `market.stream.command.v1`, keyed by the session key, the topic that also carries subscribe, unsubscribe and the instance heartbeat; forward-service unsubscribes on TTL and drops the session, while the shared TTL socket stays open for other customers. Beside it, the safety net: every instance beats every five seconds, and three missed beats drop all of that instance's sessions.
+**Text alternative:** Above, the four states of a connection: OPEN once the ticket is spent, the partition checked, the handshake answered and a connection id issued; ACTIVE once the first subscribe is accepted and the upstream subscription exists; CLOSING once a reason is known and the teardown has been sent; CLOSED once the registry entry is gone. Below, what happens when it ends: market-stream closes the socket and sends `stream.close` on `market.stream.command.v1`, keyed by the session key, the topic that also carries subscribe, unsubscribe and the instance heartbeat; forward-service unsubscribes on TTL and drops the session, while the shared TTL socket stays open for other customers. Beside it, the safety net: every instance beats every five seconds, and three missed beats drop all of that instance's sessions.
 
 A connection is state held in one instance's memory, so every way it can end must free that state — and the provider subscription it created.
 
 | State | Entered by | Upstream |
 |---|---|---|
-| `OPEN` | Handshake complete, `p` verified, `connectionId` issued | Nothing yet |
+| `OPEN` | Ticket spent, `p` verified, handshake answered `101`, `connectionId` issued | Nothing yet |
 | `ACTIVE` | The first `sub` accepted | `forward-service` has subscribed |
 | `CLOSING` | Any reason below | Teardown sent |
 | `CLOSED` | Socket closed, registry entry removed | Unsubscribed |
@@ -826,9 +852,10 @@ Each `market-stream` instance beats every **5 s** on the command topic. `forward
 |---|---|---|
 | `AUTH_TOKEN_EXPIRED` | The provider session is dead | Log in again, then connect and subscribe |
 | `STREAM_IDLE` | Two pings went unanswered | Reconnect when the client is alive again |
-| `STREAM_WRONG_NODE` | The ingress routed to the wrong instance; the correct `p` is in the reason | Reconnect to `p` |
 | `STREAM_SLOW_CONSUMER` | The client could not keep up | Reconnect with fewer symbols |
 | `STREAM_GOING_AWAY` | The instance is draining | Reconnect |
+
+A wrong instance and an invalid ticket are refused at the handshake, as HTTP statuses, because no socket exists yet (§B4.3).
 
 ### B4.7 A slow client must not slow the others
 
@@ -883,7 +910,9 @@ The transports are named in the env (§C10.4), never in code, and the core is id
 | A subscription loses its entitlement | `end` `ENTITLEMENT_REVOKED` — logging in again does not help |
 | Provider session expired | Close `AUTH_TOKEN_EXPIRED` (§B4.4) |
 | Client stopped answering pings | Close `STREAM_IDLE`, and the subscriptions are torn down upstream (§B4.5) |
-| Wrong instance · slow client · draining | Close `STREAM_WRONG_NODE` · `STREAM_SLOW_CONSUMER` · `STREAM_GOING_AWAY` |
+| Slow client · draining | Close `STREAM_SLOW_CONSUMER` · `STREAM_GOING_AWAY` |
+| Ticket missing, expired or already spent | Handshake refused `401 STREAM_TICKET_INVALID` — log in again (§B4.3) |
+| Ticket belongs to another partition | Handshake refused `409 STREAM_WRONG_NODE`, the correct `p` in the body |
 
 ## B5. Delayed delivery — **Open**
 
@@ -951,7 +980,8 @@ Authorization: Bearer <token 1>
 | 2 | Open the TTL info socket | `websocket.info.url` of the TTL provider configuration, e.g. `wss://…/info/pubsub` |
 | 3 | Send `LOGIN` | The frame below |
 | 4 | Read the reply | `rtnCode = 0` → `sessID = sessionID`, or `detail.data` when `sessionID` is absent |
-| 5 | Answer the client | The response below. Nothing is kept |
+| 5 | Hash the session and mint the ticket | `sessionKey = xxHash64(salt ‖ sessID)`, `p = sessionKey % P`, and one random ticket written to Redis as `{ sessionKey, p }` for 60 s (§B4.3) |
+| 6 | Answer the client | The response below. No session is kept — the ticket record names one, it does not hold one |
 
 **`LOGIN` frame** — the shape captured in UAT
 
@@ -977,7 +1007,7 @@ Authorization: Bearer <token 1>
 **Response to the client**
 
 ```json
-{ "mdsToken": "<sessID>", "user": "uat_qw02", "streamPartition": 37,
+{ "mdsToken": "<sessID>", "user": "uat_qw02", "streamPartition": 37, "streamTicket": "t_9QpK…",
   "services": { "XHKG": "STREAMING", "XSHG": "SNAPSHOT", "XSHE": "SNAPSHOT", "XNYS": "STREAMING" } }
 ```
 
@@ -985,6 +1015,7 @@ Authorization: Bearer <token 1>
 |---|---|
 | `mdsToken` | TTL's `sessID`, unchanged. Sent as `MDS-Authentication` on every query |
 | `streamPartition` | Which `market-stream` partition serves this session — `xxHash64(salt ‖ sessID) % P` (§B4.2). The client presents it when opening a stream |
+| `streamTicket` | A single-use ticket for the streaming handshake, valid 60 s (§B4.3). A browser cannot put a header on a WebSocket, so this is what it presents instead of the session |
 | `services` | What TTL grants this user on each exchange, wire codes mapped to platform codes (§B7.7) |
 
 | Case | HTTP · code |
@@ -1525,6 +1556,7 @@ Every reply for the Client API Gateway — FORWARD or STORAGE — goes to `marke
                "occurredAt": "2026-09-11T03:10:00.412Z", "source": "forward-service/1" },
   "payload": { "serviceCode": "auth.login", "isSuccess": true,
                "data": { "mdsToken": "<sessID>", "user": "uat_qw02", "streamPartition": 37,
+                         "streamTicket": "t_9QpK…",
                          "services": { "XHKG": "STREAMING", "XNYS": "STREAMING" } } } }
 ```
 
@@ -1607,7 +1639,8 @@ Login is not a separate service in a FORWARD deployment. To the gateway it is `s
 | Build the login token and the `LOGIN` frame exactly as ingestion's `TtlSession` does, from the TTL provider configuration | Ask for the customer's password or a second factor — the TTL MDS login needs neither |
 | Send it on the TTL info socket and read `sessID` from the reply | Issue, sign, wrap or refresh a token of its own |
 | Return `sessID` unchanged, with the `service` map in platform codes | Store the session id, the key, or a session |
-| Report a failed login without TTL's own error text | Log a request body · resolve entitlement |
+| Hash `sessID` into `sessionKey`, derive `p`, and mint the single-use stream ticket, held in Redis for 60 s — it is the only party holding the `sessID` (§B4.3) | Put the session, or anything derived from it beyond the key, into that ticket |
+| Report a failed login without TTL's own error text | Log a request body · resolve entitlement · tell the client **where** the stream lives — a URL, a scheme and a port are infrastructure, agreed between the back end and the client |
 
 It is one `gw_operation_config` row — `(auth.login, TTL)`, `msg_type LOGIN`, `channel info`, `needs_session false` — shown in full in §D1.19. Configuration comes from the same TTL provider descriptor ingestion reads: `mds.entity`, `mds.agreement`, `mds.language`, `client.device`, `client.dataDevice`, `client.version`, `websocket.info.url`; `mds.password`, `mds.key` and `mds.email` as secret-manager references (§B10.7).
 
@@ -2018,7 +2051,7 @@ Whether a connection survives a renewal depends on one question: does the identi
 |---|---|---|
 | What the client presents | The **provider's** session — it is the credential | A platform token over a session MDS owns |
 | Does renewal change it | Yes. A new provider session is a new id, a new hash and a new partition | No. The subject stays the same, so the key and the partition stay |
-| The connection | **Rebuilt** — closed with `AUTH_TOKEN_EXPIRED`, then the client logs in and reconnects (§B4.4) | **Kept** — one in-band frame carries the new token; subscriptions are never re-established |
+| The connection | **Rebuilt** — closed with `AUTH_TOKEN_EXPIRED`, then the client logs in, receives a new ticket and reconnects (§B4.4) | **Kept** — one in-band frame carries the new token; subscriptions are never re-established |
 | Periodic revalidation | None; the provider refuses at the next command | Server-side against local state, never touching the client |
 
 **Why FORWARD does not try to keep the connection.** Carrying a live connection across a change of identity would mean a second key for the socket, a state kept for a session that no longer exists, and a recovery path used by nothing else. A client must already survive a lost socket — a deploy, a network fault, a lost instance — so an expiry reuses that one path.
@@ -2036,8 +2069,9 @@ Scale comes from partitions, not from a socket cluster. The session key of §B4.
 |---|---|
 | Assignment | Static, as for replies (§D2.7): instance `i` of `M` owns every partition where `p % M == i` |
 | Partition count | `STREAM_PARTITIONS` — fixed at 64, the ceiling on instance count |
-| Ingress | Routes on the `p` the login reply gave the client. A socket on the wrong instance is closed with `STREAM_WRONG_NODE` |
-| Session registry | In memory: `sessionKey → { connectionId, sessionID, subscriptions, sequence }`. Never in Redis, never on Kafka |
+| Ingress | Routes on the `p` the login reply gave the client. A handshake landing on the wrong instance is refused `409 STREAM_WRONG_NODE` before a socket exists (§B4.3) |
+| Handshake | One atomic `GETDEL` of the ticket Redis holds, then a check that its `p` is this instance's. A ticket opens one socket and is not renewed: a lost socket is rebuilt by logging in again (§B4.4) |
+| Session registry | In memory: `sessionKey → { connectionId, subscriptions, sequence }`. No `sessionID` — the instance is never told one. Never in Redis, never on Kafka |
 | Ordering | One session's subscribe, unsubscribe, close and delivery messages share a key, so they keep their order |
 | Teardown | Every ended socket sends one idempotent `stream.close` on `market.stream.command.v1`, so `forward-service` unsubscribes upstream and the provider subscription never outlives the socket (§B4.5) |
 | Heartbeat | Each instance beats every 5 s on the same topic. `forward-service` groups its upstream state by message `source`; a source silent for three beats has its sessions dropped — the safety net for an instance that dies before it can send a teardown |
@@ -2066,6 +2100,7 @@ STREAM_PARTITIONS=64
 STREAM_INSTANCE_ORDINAL=0
 STREAM_PING_INTERVAL=15s
 STREAM_HEARTBEAT=5s
+STREAM_TICKET_TTL=60s
 # STREAM_TRANSPORTS=websocket,mqtt
 # STREAM_MQTT_BROKER=tcp://emqx:1883
 ```
@@ -2073,8 +2108,9 @@ STREAM_HEARTBEAT=5s
 | In the core — every transport | In the adapter — per transport |
 |---|---|
 | Session registry and subscription index | Frame encoding and field names |
+| Spending the ticket at the handshake (§B4.3) | |
 | Entitlement at subscribe, and revalidation | How a per-symbol error is reported |
-| Realtime or delayed selection | Close codes, heartbeat, handshake |
+| Realtime or delayed selection | Close codes, heartbeat, and how the ticket arrives — a query parameter on the WebSocket handshake, the password field on an MQTT `CONNECT` |
 | Conflation, rate capping, slow-consumer cutoff | Topic naming and broker ACL — MQTT only |
 | Reading Kafka and filtering by symbol | |
 
